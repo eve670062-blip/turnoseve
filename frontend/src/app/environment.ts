@@ -1,4 +1,4 @@
 export const environment = {
-  apiUrl: 'http://localhost:8000/api',
-  websocketUrl: 'ws://localhost:8000/ws/board',
+  apiUrl: 'https://TU-BACKEND.onrender.com/api',
+  websocketUrl: 'wss://TU-BACKEND.onrender.com/ws/board',
 };
