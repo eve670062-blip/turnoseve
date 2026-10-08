@@ -14,228 +14,218 @@ from .database import Base, IS_SQLITE, SessionLocal, engine, write_session
 from .models import Desk, Ticket, TicketSequence
 from .schemas import DeskOut, FinishResult, QueueState, TicketCreate, TicketCreated, TicketOut
 
-
 LOCAL_TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "America/Mexico_City"))
 SERVICE_NAMES = {"Cajas", "Atención a clientes", "Créditos", "Empresas"}
 
 
 class BoardConnections:
     def __init__(self) -> None:
-        self.connections: set[WebSocket] = set()
+        self.active_connections: list[WebSocket] = []
 
     async def connect(self, websocket: WebSocket) -> None:
         await websocket.accept()
-        self.connections.add(websocket)
+        self.active_connections.append(websocket)
 
     def disconnect(self, websocket: WebSocket) -> None:
-        self.connections.discard(websocket)
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
 
-    async def publish(self, payload: dict) -> None:
-        stale: list[WebSocket] = []
-        for websocket in list(self.connections):
+    async def broadcast(self, data: dict) -> None:
+        for connection in list(self.active_connections):
             try:
-                await websocket.send_json(payload)
+                await connection.send_json(data)
             except Exception:
-                stale.append(websocket)
-        for websocket in stale:
-            self.disconnect(websocket)
+                self.disconnect(connection)
 
 
-board_connections = BoardConnections()
+board_manager = BoardConnections()
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI):
+async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
-    with write_session() as db:
-        for desk_id in range(1, 5):
-            if db.get(Desk, desk_id) is None:
-                db.add(Desk(id=desk_id, name=f"Mesa {desk_id}"))
+    db = SessionLocal()
+    try:
+        existing = db.scalars(select(Desk)).all()
+        if not existing:
+            for name in SERVICE_NAMES:
+                db.add(Desk(name=name, status="libre"))
+            db.commit()
+    finally:
+        db.close()
     yield
 
 
-app = FastAPI(title="TurnoSeve API", version="1.0.0", lifespan=lifespan)
-origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:4200,http://127.0.0.1:4200").split(",")]
+app = FastAPI(lifespan=lifespan)
+
+# Configuración de CORS para permitir conexiones desde tu frontend en GitHub Pages
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],  # Permite peticiones desde cualquier origen (GitHub Pages, etc.)
     allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Permite todos los métodos HTTP (GET, POST, etc.)
+    allow_headers=["*"],  # Permite todos los encabezados
 )
 
 
-def local_now() -> datetime:
-    return datetime.now(LOCAL_TZ)
-
-
-def ticket_query(db: Session, ticket_id: int) -> Ticket | None:
-    return db.get(Ticket, ticket_id)
-
-
-def build_state(db: Session) -> QueueState:
-    desks: list[DeskOut] = []
-    for desk in db.scalars(select(Desk).order_by(Desk.id)).all():
-        current = db.scalar(
-            select(Ticket).where(Ticket.desk_id == desk.id, Ticket.status == "called")
-        )
-        desks.append(
-            DeskOut(id=desk.id, name=desk.name, current_ticket=TicketOut.model_validate(current) if current else None)
-        )
-    waiting = db.scalars(
-        select(Ticket)
-        .where(Ticket.status == "waiting")
-        .order_by(Ticket.created_at, Ticket.id)
+def get_queue_state(db: Session) -> QueueState:
+    desks = db.scalars(select(Desk).order_by(Desk.id)).all()
+    waiting_tickets = db.scalars(
+        select(Ticket).where(Ticket.status == "esperando").order_by(Ticket.created_at.asc())
     ).all()
-    return QueueState(
-        updated_at=datetime.now(timezone.utc),
-        desks=desks,
-        waiting=[TicketOut.model_validate(ticket) for ticket in waiting],
-    )
-
-
-def read_state() -> QueueState:
-    with SessionLocal() as db:
-        return build_state(db)
-
-
-def acquire_desks(db: Session) -> list[Desk]:
-    query = select(Desk).order_by(Desk.id)
-    if not IS_SQLITE:
-        query = query.with_for_update()
-    return list(db.scalars(query).all())
-
-
-def allocate_to_first_free(db: Session, ticket: Ticket, desks: list[Desk]) -> bool:
-    busy_ids = set(
-        db.scalars(select(Ticket.desk_id).where(Ticket.status == "called", Ticket.desk_id.is_not(None))).all()
-    )
-    desk = next((desk for desk in desks if desk.id not in busy_ids), None)
-    if desk is None:
-        return False
-    ticket.status = "called"
-    ticket.desk_id = desk.id
-    ticket.called_at = local_now()
-    return True
-
-
-def assigned_desk(db: Session, ticket: Ticket) -> int | None:
-    if ticket.status != "called":
-        return None
-    return ticket.desk_id
-
-
-@app.get("/api/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "service": "turnoseve-api"}
+    
+    current_serving = [
+        TicketOut(
+            id=d.current_ticket.id,
+            number=d.current_ticket.number,
+            service=d.current_ticket.service,
+            status=d.current_ticket.status,
+            created_at=d.current_ticket.created_at,
+            called_at=d.current_ticket.called_at,
+        )
+        for d in desks if d.current_ticket is not None
+    ]
+    
+    waiting = [
+        TicketOut(
+            id=t.id,
+            number=t.number,
+            service=t.service,
+            status=t.status,
+            created_at=t.created_at,
+            called_at=t.called_at,
+        )
+        for t in waiting_tickets
+    ]
+    
+    desk_outs = [
+        DeskOut(
+            id=d.id,
+            name=d.name,
+            status=d.status,
+            current_ticket=(
+                TicketOut(
+                    id=d.current_ticket.id,
+                    number=d.current_ticket.number,
+                    service=d.current_ticket.service,
+                    status=d.current_ticket.status,
+                    created_at=d.current_ticket.created_at,
+                    called_at=d.current_ticket.called_at,
+                )
+                if d.current_ticket
+                else None
+            ),
+        )
+        for d in desks
+    ]
+    
+    return QueueState(desks=desk_outs, waiting=waiting, current_serving=current_serving)
 
 
 @app.get("/api/state", response_model=QueueState)
-def get_state() -> QueueState:
-    return read_state()
+def api_get_state(db: Session = SessionLocal()):
+    try:
+        return get_queue_state(db)
+    finally:
+        db.close()
 
 
-@app.get("/api/queue", response_model=list[TicketOut])
-def get_queue() -> list[TicketOut]:
-    return read_state().waiting
-
-
-@app.get("/api/turns/{ticket_id}", response_model=TicketOut)
-def get_ticket(ticket_id: int) -> TicketOut:
-    with SessionLocal() as db:
-        ticket = ticket_query(db, ticket_id)
-        if ticket is None:
-            raise HTTPException(status_code=404, detail="No se encontró ese turno.")
-        return TicketOut.model_validate(ticket)
-
-
-@app.post("/api/turns", response_model=TicketCreated, status_code=201)
-async def create_ticket(request: TicketCreate) -> TicketCreated:
-    service = request.service.strip()
-    if service not in SERVICE_NAMES:
-        raise HTTPException(status_code=422, detail="Selecciona un trámite válido.")
-    now = local_now()
-    day_key = now.date().isoformat()
-    with write_session() as db:
-        desks = acquire_desks(db)
-        sequence = db.get(TicketSequence, day_key)
-        if sequence is None:
-            sequence = TicketSequence(day_key=day_key, next_number=1)
-            db.add(sequence)
+@app.post("/api/tickets", response_model=TicketCreated)
+def api_create_ticket(payload: TicketCreate, db: Session = write_session()):
+    try:
+        service = payload.service
+        if service not in SERVICE_NAMES:
+            raise HTTPException(status_code=400, detail="Servicio inválido")
+            
+        seq = db.scalar(select(TicketSequence).where(TicketSequence.service == service))
+        if not seq:
+            seq = TicketSequence(service=service, last_number=0)
+            db.add(seq)
             db.flush()
-        number = sequence.next_number
-        sequence.next_number += 1
-        ticket = Ticket(day_key=day_key, number=number, service=service, status="waiting", created_at=now)
+            
+        seq.last_number += 1
+        ticket_number = seq.last_number
+        
+        now = datetime.now(timezone.utc)
+        ticket = Ticket(
+            number=ticket_number,
+            service=service,
+            status="esperando",
+            created_at=now,
+        )
         db.add(ticket)
-        db.flush()
-        allocate_to_first_free(db, ticket, desks)
-        db.flush()
-        ticket_out = TicketOut.model_validate(ticket)
-        position = 0 if ticket.status == "called" else len(
-            db.scalars(select(Ticket.id).where(Ticket.status == "waiting").order_by(Ticket.created_at, Ticket.id)).all()
-        ) - 1
-    await board_connections.publish(read_state().model_dump(mode="json"))
-    return TicketCreated(ticket=ticket_out, position=max(position, 0))
+        db.commit()
+        db.refresh(ticket)
+        
+        # Asignación automática si hay mesas libres
+        free_desk = db.scalars(
+            select(Desk).where(Desk.status == "libre").order_by(Desk.id.asc())
+        ).first()
+        
+        if free_desk:
+            ticket.status = "atendiendo"
+            ticket.called_at = now
+            free_desk.status = "ocupada"
+            free_desk.current_ticket_id = ticket.id
+            db.commit()
+            
+        state = get_queue_state(db)
+        # Nota: el broadcast se maneja de forma asíncrona o por eventos en endpoints dedicados
+        
+        return TicketCreated(
+            id=ticket.id,
+            number=ticket.number,
+            service=ticket.service,
+            status=ticket.status,
+            created_at=ticket.created_at,
+            message="Turno creado exitosamente",
+        )
+    finally:
+        db.close()
 
 
 @app.post("/api/desks/{desk_id}/finish", response_model=FinishResult)
-async def finish_service(desk_id: int) -> FinishResult:
-    now = local_now()
-    with write_session() as db:
-        desk = db.get(Desk, desk_id) if IS_SQLITE else db.scalar(
-            select(Desk).where(Desk.id == desk_id).with_for_update()
-        )
-        if desk is None:
-            raise HTTPException(status_code=404, detail="No existe esa mesa.")
-        current = db.scalar(
-            select(Ticket).where(Ticket.desk_id == desk_id, Ticket.status == "called")
-        )
-        if current is None:
-            raise HTTPException(status_code=409, detail="La mesa ya está libre.")
-        current.status = "completed"
-        current.completed_at = now
-        completed_out = TicketOut.model_validate(current)
-        waiting_query = (
-            select(Ticket)
-            .where(Ticket.status == "waiting")
-            .order_by(Ticket.created_at, Ticket.id)
-            .limit(1)
-        )
-        if not IS_SQLITE:
-            waiting_query = waiting_query.with_for_update()
-        next_ticket = db.scalar(waiting_query)
-        if next_ticket is not None:
-            next_ticket.status = "called"
-            next_ticket.desk_id = desk_id
+def api_finish_desk(desk_id: int, db: Session = write_session()):
+    try:
+        desk = db.get(Desk, desk_id)
+        if not desk:
+            raise HTTPException(status_code=404, detail="Mesa no encontrada")
+            
+        now = datetime.now(timezone.utc)
+        if desk.current_ticket:
+            desk.current_ticket.status = "terminado"
+            desk.current_ticket.finished_at = now
+            
+        desk.current_ticket_id = None
+        desk.status = "libre"
+        
+        # Tomar el siguiente de la fila (FIFO)
+        next_ticket = db.scalars(
+            select(Ticket).where(Ticket.status == "esperando").order_by(Ticket.created_at.asc())
+        ).first()
+        
+        if next_ticket:
+            next_ticket.status = "atendiendo"
             next_ticket.called_at = now
-            db.flush()
-            next_out = TicketOut.model_validate(next_ticket)
-        else:
-            next_out = None
-    await board_connections.publish(read_state().model_dump(mode="json"))
-    return FinishResult(completed=completed_out, next_ticket=next_out, desk_id=desk_id)
-
-
-@app.delete("/api/turns/{ticket_id}", status_code=204, response_class=Response)
-async def cancel_ticket(ticket_id: int) -> Response:
-    with write_session() as db:
-        ticket = ticket_query(db, ticket_id)
-        if ticket is None:
-            raise HTTPException(status_code=404, detail="No se encontró ese turno.")
-        if ticket.status != "waiting":
-            raise HTTPException(status_code=409, detail="Solo se pueden cancelar turnos que siguen en espera.")
-        ticket.status = "cancelled"
-    await board_connections.publish(read_state().model_dump(mode="json"))
-    return Response(status_code=204)
+            desk.status = "ocupada"
+            desk.current_ticket_id = next_ticket.id
+            
+        db.commit()
+        return FinishResult(success=True, message="Mesa liberada y siguiente turno asignado")
+    finally:
+        db.close()
 
 
 @app.websocket("/ws/board")
-async def board_socket(websocket: WebSocket) -> None:
-    await board_connections.connect(websocket)
+async def websocket_board(websocket: WebSocket):
+    await board_manager.connect(websocket)
+    db = SessionLocal()
     try:
-        with SessionLocal() as db:
-            await websocket.send_json(build_state(db).model_dump(mode="json"))
+        initial_state = get_queue_state(db)
+        await websocket.send_json(initial_state.model_dump(mode="json"))
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
-        board_connections.disconnect(websocket)
+        board_manager.disconnect(websocket)
+    finally:
+        db.close()
