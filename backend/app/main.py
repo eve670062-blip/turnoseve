@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -58,14 +58,31 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# Configuración de CORS para permitir conexiones desde tu frontend en GitHub Pages
+# Configuración de CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Permite peticiones desde cualquier origen (GitHub Pages, etc.)
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Permite todos los métodos HTTP (GET, POST, etc.)
-    allow_headers=["*"],  # Permite todos los encabezados
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
+
+# Dependencia para manejar la sesión de la base de datos correctamente en FastAPI
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def get_write_db():
+    db = write_session()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 def get_queue_state(db: Session) -> QueueState:
@@ -123,97 +140,85 @@ def get_queue_state(db: Session) -> QueueState:
 
 
 @app.get("/api/state", response_model=QueueState)
-def api_get_state(db: Session = SessionLocal()):
-    try:
-        return get_queue_state(db)
-    finally:
-        db.close()
+def api_get_state(db: Session = Depends(get_db)):
+    return get_queue_state(db)
 
 
 @app.post("/api/tickets", response_model=TicketCreated)
-def api_create_ticket(payload: TicketCreate, db: Session = write_session()):
-    try:
-        service = payload.service
-        if service not in SERVICE_NAMES:
-            raise HTTPException(status_code=400, detail="Servicio inválido")
-            
-        seq = db.scalar(select(TicketSequence).where(TicketSequence.service == service))
-        if not seq:
-            seq = TicketSequence(service=service, last_number=0)
-            db.add(seq)
-            db.flush()
-            
-        seq.last_number += 1
-        ticket_number = seq.last_number
+def api_create_ticket(payload: TicketCreate, db: Session = Depends(get_write_db)):
+    service = payload.service
+    if service not in SERVICE_NAMES:
+        raise HTTPException(status_code=400, detail="Servicio inválido")
         
-        now = datetime.now(timezone.utc)
-        ticket = Ticket(
-            number=ticket_number,
-            service=service,
-            status="esperando",
-            created_at=now,
-        )
-        db.add(ticket)
+    seq = db.scalar(select(TicketSequence).where(TicketSequence.service == service))
+    if not seq:
+        seq = TicketSequence(service=service, last_number=0)
+        db.add(seq)
+        db.flush()
+        
+    seq.last_number += 1
+    ticket_number = seq.last_number
+    
+    now = datetime.now(timezone.utc)
+    ticket = Ticket(
+        number=ticket_number,
+        service=service,
+        status="esperando",
+        created_at=now,
+    )
+    db.add(ticket)
+    db.commit()
+    db.refresh(ticket)
+    
+    # Asignación automática si hay mesas libres
+    free_desk = db.scalars(
+        select(Desk).where(Desk.status == "libre").order_by(Desk.id.asc())
+    ).first()
+    
+    if free_desk:
+        ticket.status = "atendiendo"
+        ticket.called_at = now
+        free_desk.status = "ocupada"
+        free_desk.current_ticket_id = ticket.id
         db.commit()
-        db.refresh(ticket)
         
-        # Asignación automática si hay mesas libres
-        free_desk = db.scalars(
-            select(Desk).where(Desk.status == "libre").order_by(Desk.id.asc())
-        ).first()
-        
-        if free_desk:
-            ticket.status = "atendiendo"
-            ticket.called_at = now
-            free_desk.status = "ocupada"
-            free_desk.current_ticket_id = ticket.id
-            db.commit()
-            
-        state = get_queue_state(db)
-        # Nota: el broadcast se maneja de forma asíncrona o por eventos en endpoints dedicados
-        
-        return TicketCreated(
-            id=ticket.id,
-            number=ticket.number,
-            service=ticket.service,
-            status=ticket.status,
-            created_at=ticket.created_at,
-            message="Turno creado exitosamente",
-        )
-    finally:
-        db.close()
+    return TicketCreated(
+        id=ticket.id,
+        number=ticket.number,
+        service=ticket.service,
+        status=ticket.status,
+        created_at=ticket.created_at,
+        message="Turno creado exitosamente",
+    )
 
 
 @app.post("/api/desks/{desk_id}/finish", response_model=FinishResult)
-def api_finish_desk(desk_id: int, db: Session = write_session()):
-    try:
-        desk = db.get(Desk, desk_id)
-        if not desk:
-            raise HTTPException(status_code=404, detail="Mesa no encontrada")
-            
-        now = datetime.now(timezone.utc)
-        if desk.current_ticket:
-            desk.current_ticket.status = "terminado"
-            desk.current_ticket.finished_at = now
-            
-        desk.current_ticket_id = None
-        desk.status = "libre"
+def api_finish_desk(desk_id: int, db: Session = Depends(get_write_db)):
+    desk = db.get(Desk, desk_id)
+    if not desk:
+        raise HTTPException(status_code=404, detail="Mesa no encontrada")
         
-        # Tomar el siguiente de la fila (FIFO)
-        next_ticket = db.scalars(
-            select(Ticket).where(Ticket.status == "esperando").order_by(Ticket.created_at.asc())
-        ).first()
+    now = datetime.now(timezone.utc)
+    if desk.current_ticket:
+        desk.current_ticket.status = "terminado"
+        desk.current_ticket.finished_at = now
         
-        if next_ticket:
-            next_ticket.status = "atendiendo"
-            next_ticket.called_at = now
-            desk.status = "ocupada"
-            desk.current_ticket_id = next_ticket.id
-            
-        db.commit()
-        return FinishResult(success=True, message="Mesa liberada y siguiente turno asignado")
-    finally:
-        db.close()
+    desk.current_ticket_id = None
+    desk.status = "libre"
+    
+    # Tomar el siguiente de la fila (FIFO)
+    next_ticket = db.scalars(
+        select(Ticket).where(Ticket.status == "esperando").order_by(Ticket.created_at.asc())
+    ).first()
+    
+    if next_ticket:
+        next_ticket.status = "atendiendo"
+        next_ticket.called_at = now
+        desk.status = "ocupada"
+        desk.current_ticket_id = next_ticket.id
+        
+    db.commit()
+    return FinishResult(success=True, message="Mesa liberada y siguiente turno asignado")
 
 
 @app.websocket("/ws/board")
